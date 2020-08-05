@@ -4,7 +4,7 @@ from flair.data import Dictionary, Corpus
 from flair_parser.flair_biaffine_parser.flair_biaffine_parser import BiAffineParser
 from flair.models import sequence_tagger_model
 
-from flair_parser.trainer import ModelTrainer
+from trainer import ModelTrainer
 import flair
 import torch
 
