@@ -35,12 +35,12 @@ class BiAffineParser(flair.nn.Model):
             relearn_embeddings: bool = True,
             train_initial_hidden_state: bool = False,
             pickle_module: str = "pickle",
-
+            beta: float = 1.0,
     ):
 
         super(BiAffineParser, self).__init__()
         self.token_embeddings = token_embeddings
-
+        self.beta = beta
         self.relations_dictionary: Dictionary = relations_dictionary
         print(len(relations_dictionary))
         self.relearn_embeddings = relearn_embeddings
@@ -144,9 +144,17 @@ class BiAffineParser(flair.nn.Model):
         return score_arc, score_rel
 
     def forward_loss(self, data_points: List[Sentence]) -> torch.tensor:
-        # lengths: List[int] = [len(sentence.tokens) for sentence in data_points]
 
         score_arc, score_rel = self.forward(data_points)
+        loss_arc, loss_rel = self._calculate_loss(score_arc, score_rel, data_points)
+        main_loss = loss_arc + loss_rel
+
+        return main_loss
+
+    def _calculate_loss(self, score_arc: torch.tensor,
+                        score_relation: torch.tensor,
+                        data_points: List[Sentence]) -> Tuple[float, float]:
+
         arc_loss = 0.0
         rel_loss = 0.0
 
@@ -161,7 +169,147 @@ class BiAffineParser(flair.nn.Model):
             rel_labels = [self.relations_dictionary.get_idx_for_item(token.tags['dependency'].value)
                           for token in sen.tokens]
             rel_labels = torch.tensor(rel_labels, dtype=torch.int64, device=flair.device)
-            score_rel = score_rel[sen_id][torch.arange(len(arc_labels)), arc_labels]
-            rel_loss += self.loss_function(score_rel, rel_labels)
+            score_relation = score_relation[sen_id][torch.arange(len(arc_labels)), arc_labels]
+            rel_loss += self.loss_function(score_relation, rel_labels)
 
-        return arc_loss+rel_loss
+        return arc_loss, rel_loss
+
+    def evaluate(
+        self,
+        data_loader: DataLoader,
+        out_path: Path = None,
+        embedding_storage_mode: str = "none",
+    ) -> (Result, float):
+
+        if type(out_path) == str:
+            out_path = Path(out_path)
+        metric = Metric("Evaluation", beta=self.beta)
+        parsing_metric = ParsingMetric()
+
+        lines: List[str] = []
+
+        eval_loss_arc = 0
+        eval_loss_rel = 0
+
+        for batch_idx, batch in enumerate(data_loader):
+
+            with torch.no_grad():
+                score_arc, score_rel = self.forward(batch)
+                loss_arc, loss_rel = self._calculate_loss(score_arc, score_rel, batch)
+                arc_prediction, relation_prediction = self._obtain_labels_(score_arc, score_rel)
+
+            parsing_metric(arc_prediction, relation_prediction, batch)
+
+            eval_loss_arc += loss_arc
+            eval_loss_rel += loss_rel
+
+            for (sentence, arcs, sent_tags) in zip(batch, arc_prediction, relation_prediction):
+                for (token, arc, tag) in zip(sentence.tokens, arcs, sent_tags):
+                    token: Token = token
+                    token.add_tag_label("predicted", Label(tag))
+                    token.add_tag_label("predicted_head_id", Label(str(arc)))
+
+                    # append both to file for evaluation
+                    eval_line = "{} {} {} {} {}\n".format(
+                        token.text,
+                        token.tags['dependency'].value,
+                        str(token.head_id),
+                        tag,
+                        str(arc),
+                    )
+                    lines.append(eval_line)
+                lines.append("\n")
+
+            for sentence in batch:
+
+                # make list of gold tags
+                gold_tags = [token.tags['dependency'].value for token in sentence.tokens]
+
+                # make list of predicted tags
+                predicted_tags = [tag.tag for tag in sentence.get_spans("predicted")]
+
+                # check for true positives, false positives and false negatives
+                for tag_indx, predicted_tag in enumerate(predicted_tags):
+                    if predicted_tag == gold_tags[tag_indx]:
+                        metric.add_tp(tag)
+                    else:
+                        metric.add_fp(tag)
+
+                for tag_indx, label_tag in enumerate(gold_tags):
+                    if label_tag != predicted_tags[tag_indx]:
+                        metric.add_fn(tag)
+                    else:
+                        metric.add_tn(tag)
+            store_embeddings(batch, embedding_storage_mode)
+
+        eval_loss_arc /= len(data_loader)
+        eval_loss_rel /= len(data_loader)
+
+        if out_path is not None:
+            with open(out_path, "w", encoding="utf-8") as outfile:
+                outfile.write("".join(lines))
+
+        detailed_result = (
+            f"\nUAS : {parsing_metric.get_uas():.4f} - LAS : {parsing_metric.get_las():.4f}"
+            f"\neval loss rel : {eval_loss_rel:.4f} - eval loss arc : {eval_loss_arc:.4f}"
+            f"\nMICRO_AVG: acc {metric.micro_avg_accuracy()} - f1-score {metric.micro_avg_f_score()}"
+            f"\nMACRO_AVG: acc {metric.macro_avg_accuracy()} - f1-score {metric.macro_avg_f_score()}"
+        )
+        for class_name in metric.get_classes():
+            detailed_result += (
+                f"\n{class_name:<10} tp: {metric.get_tp(class_name)} - fp: {metric.get_fp(class_name)} - "
+                f"fn: {metric.get_fn(class_name)} - tn: {metric.get_tn(class_name)} - precision: "
+                f"{metric.precision(class_name):.4f} - recall: {metric.recall(class_name):.4f} - "
+                f"accuracy: {metric.accuracy(class_name):.4f} - f1-score: "
+                f"{metric.f_score(class_name):.4f}"
+            )
+
+        result = Result(
+            main_score=metric.micro_avg_f_score(),
+            log_line=f"{metric.precision()}\t{metric.recall()}\t{metric.micro_avg_f_score()}",
+            log_header="PRECISION\tRECALL\tF1",
+            detailed_results=detailed_result,
+        )
+
+        return result, eval_loss_arc+eval_loss_rel
+
+    def _obtain_labels_(self, score_arc: torch.tensor, score_rel: torch.tensor) -> Tuple[List[List[int]],
+                                                                                         List[List[str]]]:
+        arc_prediction: torch.tensor = score_arc.argmax(-1)
+        relation_prediction: torch.tensor = score_rel.argmax(-1)
+        relation_prediction = relation_prediction.gather(-1, arc_prediction.unsqueeze(-1)).squeeze(-1)
+
+        arc_prediction = [[arc+1 if token_index != arc else 0 for token_index, arc in enumerate(batch)]
+                          for batch in arc_prediction]
+        relation_prediction = [[self.relations_dictionary.get_item_for_index(rel_tag_idx)
+                                for rel_tag_idx in batch] for batch in relation_prediction]
+
+        return arc_prediction, relation_prediction
+
+
+class ParsingMetric:
+
+    def __init__(self, epsilon=1e-6):
+        self.eps = epsilon
+        self.total = 0.0
+        self.correct_arcs = 0.0
+        self.correct_rels = 0.0
+
+    def __call__(self, arc_prediction: List[List[int]],
+                 relation_prediction: List[List[str]],
+                 sentences: List[Sentence]):
+
+        for batch_indx, batch in enumerate(sentences):
+            self.total += len(batch.tokens)
+            for token_indx, token in enumerate(batch.tokens):
+                if arc_prediction[batch_indx][token_indx] == token.head_id:
+                    self.correct_arcs += 1
+                if relation_prediction[batch_indx][token_indx] == token.tags['dependency'].value:
+                    self.correct_rels += 1
+
+    def get_las(self) -> float:
+        return self.correct_rels / (self.total + self.eps)
+
+    def get_uas(self) -> float:
+        return self.correct_arcs / (self.total + self.eps)
+
