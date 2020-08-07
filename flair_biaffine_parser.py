@@ -27,64 +27,60 @@ class BiAffineParser(flair.nn.Model):
             n_mlp_arc: int = 500,
             n_mlp_rel: int = 100,
             n_lstm_layers: int = 3,
-            dropout: float = 0.3,
-            shared_dropout: float = 0.33,
             mlp_dropout: float = .33,
-            rnn_layers: int = 2,
-            word_dropout: float = 0.05,
-            locked_dropout: float = 0.5,
             lstm_dropout: float = 0.2,
             relearn_embeddings: bool = True,
-            train_initial_hidden_state: bool = False,
-            pickle_module: str = "pickle",
             beta: float = 1.0,
+            pickle_module: str = "pickle",
     ):
 
         super(BiAffineParser, self).__init__()
         self.token_embeddings = token_embeddings
         self.beta = beta
         self.relations_dictionary: Dictionary = relations_dictionary
-        print(len(relations_dictionary))
         self.relearn_embeddings = relearn_embeddings
-
+        self.lstm_hidden_size = lstm_hidden_size
+        self.n_mlp_arc = n_mlp_arc
+        self.n_mlp_rel = n_mlp_rel
+        self.n_lstm_layers = n_lstm_layers
+        self.lstm_dropout = lstm_dropout
+        self.mlp_dropout = mlp_dropout
         lstm_input_dim: int = self.token_embeddings.embedding_length
 
         if self.relations_dictionary:
             self.embedding2nn = torch.nn.Linear(lstm_input_dim, lstm_input_dim)
 
-        self.lstm = BiLSTM(input_size=lstm_input_dim,
-                           hidden_size=lstm_hidden_size,
-                           num_layers=n_lstm_layers,
-                           dropout=lstm_dropout)
-        # self.lstm_shared_dropout = SharedDropout
-        # the MLP layers
-        self.mlp_arc_h = MLP(n_in=lstm_hidden_size*2,
-                             n_hidden=n_mlp_arc,
-                             dropout=mlp_dropout)
-        self.mlp_arc_d = MLP(n_in=lstm_hidden_size*2,
-                             n_hidden=n_mlp_arc,
-                             dropout=mlp_dropout)
-        self.mlp_rel_h = MLP(n_in=lstm_hidden_size*2,
-                             n_hidden=n_mlp_rel,
-                             dropout=mlp_dropout)
-        self.mlp_rel_d = MLP(n_in=lstm_hidden_size*2,
-                             n_hidden=n_mlp_rel,
-                             dropout=mlp_dropout)
+        self.lstm = BiLSTM(input_size=self.lstm_input_dim,
+                           hidden_size=self.lstm_hidden_size,
+                           num_layers=self.n_lstm_layers,
+                           dropout=self.lstm_dropout)
+
+        self.mlp_arc_h = MLP(n_in=self.lstm_hidden_size*2,
+                             n_hidden=self.n_mlp_arc,
+                             dropout=self.mlp_dropout)
+        self.mlp_arc_d = MLP(n_in=self.lstm_hidden_size*2,
+                             n_hidden=self.n_mlp_arc,
+                             dropout=self.mlp_dropout)
+        self.mlp_rel_h = MLP(n_in=self.lstm_hidden_size*2,
+                             n_hidden=self.n_mlp_rel,
+                             dropout=self.mlp_dropout)
+        self.mlp_rel_d = MLP(n_in=self.lstm_hidden_size*2,
+                             n_hidden=self.n_mlp_rel,
+                             dropout=self.mlp_dropout)
 
         # the Biaffine layers
-        self.arc_attn = Biaffine(n_in=n_mlp_arc,
+        self.arc_attn = Biaffine(n_in=self.n_mlp_arc,
                                  bias_x=True,
                                  bias_y=False)
 
-        self.rel_attn = Biaffine(n_in=n_mlp_rel,
+        self.rel_attn = Biaffine(n_in=self.n_mlp_rel,
                                  n_out=len(relations_dictionary),
                                  bias_x=True,
                                  bias_y=True)
-        self.pad_index = "<PAD>"
-        self.unk_index = "u"
 
         self.loss_function = torch.nn.CrossEntropyLoss()
         self.to(flair.device)
+
 
     def forward(self, sentences: List[Sentence]):
         self.token_embeddings.embed(sentences)
@@ -175,6 +171,42 @@ class BiAffineParser(flair.nn.Model):
             rel_loss += self.loss_function(score_relation, rel_labels)
 
         return arc_loss, rel_loss
+
+
+
+    def _get_state_dict(self):
+        model_state = {
+            "state_dict": self.state_dict(),
+            "token_embeddings": self.token_embeddings,
+            "lstm_hidden_size": self.lstm_hidden_size,
+            "relations_dictionary": self.relations_dictionary,
+            "relearn_embeddings": self.relearn_embeddings,
+            "n_mlp_arc": self.n_mlp_arc,
+            "n_mlp_rel": self.n_mlp_rel,
+            "n_lstm_layers": self.n_lstm_layers,
+            "lstm_dropout": self.lstm_dropout,
+            "mlp_dropout": self.mlp_dropout,
+            "beta": self.beta,
+        }
+        return model_state
+
+    @staticmethod
+    def _init_model_with_state_dict(state):
+
+        model = BiAffineParser(
+            token_embeddings=state["token_embeddings"],
+            relations_dictionary=state["relations_dictionary"],
+            lstm_hidden_size=state["lstm_hidden_size"],
+            n_mlp_arc=state["n_mlp_arc"],
+            n_mlp_rel=state["n_mlp_rel"],
+            n_lstm_layers=state["n_lstm_layers"],
+            mlp_dropout=state["mlp_dropout"],
+            lstm_dropout=state["lstm_dropout"],
+            relearn_embeddings=state["relearn_embeddings"],
+            beta=state["beta"],
+        )
+        model.load_state_dict(state["state_dict"])
+        return model
 
     def evaluate(
         self,
